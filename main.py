@@ -4,7 +4,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from constants import BOT_TOKEN
 import user_handlers
 import dev_handlers
-from data import user_names
+from data import user_names, is_user_banned
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -16,13 +16,24 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 async def combined_message_handler(update, context):
     """Комбинированный обработчик текстовых сообщений."""
     user_id = update.effective_user.id
+    
+    # Проверка бана ПЕРВЫМ ДЕЛОМ
+    if is_user_banned(user_id):
+        # Не отправляем сообщение, просто игнорируем
+        user_handlers.logger.info(f"Сообщение от забаненного пользователя {user_id} проигнорировано: '{update.message.text}'")
+        # ВАЖНО: НЕ вызываем await update.message.reply_text("❌ Вы забанены...")
+        return
+    
     text = update.message.text
-    current_user_name = user_names.get(user_id, "Неизвестный пользователь")
+    
+    # Получаем имя пользователя
+    current_user_data = user_names.get(user_id)
+    current_user_name = current_user_data["name"] if current_user_data else "Неизвестный пользователь"
     user_handlers.logger.info(f"combined_message_handler: Получено сообщение от пользователя {user_id} ({current_user_name}): '{text}'")
 
     if user_id not in user_names:
         user_handlers.logger.info(f"Сохраняю имя '{text}' для нового пользователя {user_id}.")
-        user_names[user_id] = text
+        user_names[user_id] = {"name": text, "banned": False}
         from data import save_data_to_file
         save_data_to_file()
         await update.message.reply_text(f"Привет, {text}!")
@@ -51,6 +62,7 @@ application.add_handler(CallbackQueryHandler(user_handlers.go_back, pattern='^ba
 application.add_handler(CallbackQueryHandler(user_handlers.show_queue, pattern='^show_queue_'))
 application.add_handler(CallbackQueryHandler(user_handlers.join_queue, pattern='^join_'))
 application.add_handler(CallbackQueryHandler(user_handlers.handle_passed, pattern='^passed_'))
+application.add_handler(CallbackQueryHandler(user_handlers.show_rating, pattern='^show_rating$'))
 application.add_handler(CallbackQueryHandler(dev_handlers.handle_dev_callback, pattern='^(dev_|back_to_menu)'))
 
 if __name__ == '__main__':

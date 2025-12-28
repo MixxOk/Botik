@@ -1,8 +1,11 @@
+# dev_handlers.py
+
 import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 from constants import SUBJECTS
-from data import user_names, queues, remove_user_from_queue
+from data import user_names, queues, remove_user_from_queue, is_user_banned, ban_user, unban_user, get_all_banned_users
+from rating import update_rating, format_rating_message
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +20,9 @@ awaiting_user_selection_add = set()
 awaiting_position_selection_add = set()
 selected_subject_for_add = {}
 selected_user_for_add = {}
+# --- Переменные для бана ---
+awaiting_ban_user_selection = set()
+awaiting_unban_user_selection = set()
 
 DEV_CODE = '2411'
 
@@ -41,9 +47,14 @@ async def show_dev_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.info(f"[DEV_MENU] Показываем меню разработчика пользователю {user_id}")
     keyboard = [
         [InlineKeyboardButton("База данных", callback_data='dev_show_db')],
+        [InlineKeyboardButton("📊 Обновить рейтинг", callback_data='dev_update_rating')],
         [InlineKeyboardButton("Убрать из очереди", callback_data='dev_remove_user_start')],
         [InlineKeyboardButton("Забыть пользователя", callback_data='dev_forget_user_start')],
-        [InlineKeyboardButton("Добавить в очередь", callback_data='dev_add_user_start')], # <-- Новая кнопка
+        [InlineKeyboardButton("Добавить в очередь", callback_data='dev_add_user_start')],
+        [InlineKeyboardButton("Очистить очереди от неизвестных", callback_data='dev_clean_unknown')],
+        [InlineKeyboardButton("🚫 Забанить", callback_data='dev_ban_user_start')],
+        [InlineKeyboardButton("✅ Разбанить", callback_data='dev_unban_user_start')],
+        [InlineKeyboardButton("Банлист", callback_data='dev_show_ban_list')],
         [InlineKeyboardButton("← Назад", callback_data='dev_back_to_user_menu')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -63,8 +74,9 @@ async def show_database_content(update: Update, context: ContextTypes.DEFAULT_TY
     message = "Содержимое базы данных:\n\n"
     message += "<b>Пользователи:</b>\n"
     if user_names:
-        for uid, name in user_names.items():
-            message += f"  ID: {uid}, Имя: {name}\n"
+        for uid, data in user_names.items():
+            ban_status = "🚫 ЗАБАНЕН" if data.get("banned", False) else "✅"
+            message += f"  {ban_status} ID: {uid}, Имя: {data['name']}\n"
     else:
         message += "  Нет зарегистрированных пользователей.\n"
 
@@ -98,10 +110,11 @@ async def start_remove_user_process(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     await query.answer()
 
+    awaiting_subject_selection.discard(user_id)
     awaiting_user_selection.discard(user_id)
     selected_subject_for_removal.pop(user_id, None)
     awaiting_user_forget_selection.discard(user_id)
-    awaiting_subject_selection_add.discard(user_id) # Очищаем и другие состояния
+    awaiting_subject_selection_add.discard(user_id)
     awaiting_user_selection_add.discard(user_id)
     selected_subject_for_add.pop(user_id, None)
     selected_user_for_add.pop(user_id, None)
@@ -119,12 +132,12 @@ async def start_remove_user_process(update: Update, context: ContextTypes.DEFAUL
 async def select_subject_for_removal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает выбор предмета и запрашивает выбор пользователя."""
     user_id = update.effective_user.id
-    logger.info(f"[DEV_SELECT_SUBJECT] Пользователь {user_id} выбрал предмет для удаления.")
+    logger.info(f"[DEV_SELECT_SUBJECT_REMOVE] Пользователь {user_id} выбрал предмет для удаления.")
     query = update.callback_query
     await query.answer()
 
     if user_id not in awaiting_subject_selection:
-        logger.warning(f"[DEV_SELECT_SUBJECT] Пользователь {user_id} не в состоянии ожидания выбора предмета.")
+        logger.warning(f"[DEV_SELECT_SUBJECT_REMOVE] Пользователь {user_id} не в состоянии ожидания выбора предмета.")
         await query.edit_message_text("Ошибка состояния. Пожалуйста, начните снова.")
         await show_dev_menu(update, context)
         return
@@ -142,7 +155,18 @@ async def select_subject_for_removal(update: Update, context: ContextTypes.DEFAU
 
     keyboard = []
     for name in queue_users:
-        keyboard.append([InlineKeyboardButton(name, callback_data=f'dev_confirm_remove_user_{name}')])
+        # Найдем ID пользователя по имени
+        user_id_to_remove = None
+        for id, data in user_names.items():
+            if data["name"] == name:
+                user_id_to_remove = id
+                break
+        # Используем ID в callback_data
+        if user_id_to_remove is not None:
+            keyboard.append([InlineKeyboardButton(name, callback_data=f'dev_confirm_remove_user_{user_id_to_remove}')])
+        else:
+            logger.warning(f"[DEV_SELECT_SUBJECT_REMOVE] Имя '{name}' из очереди '{subject}' не найдено в user_names.")
+            continue
 
     keyboard.append([InlineKeyboardButton("← Назад", callback_data='dev_remove_user_start')])
 
@@ -162,7 +186,15 @@ async def confirm_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_dev_menu(update, context)
         return
 
-    selected_user_name = query.data.split('dev_confirm_remove_user_')[1]
+    selected_user_id_str = query.data.split('dev_confirm_remove_user_')[1]
+    try:
+        selected_user_id = int(selected_user_id_str)
+    except ValueError:
+        logger.error(f"[DEV_CONFIRM_REMOVE] Неверный формат ID пользователя '{selected_user_id_str}' от {user_id}.")
+        await query.edit_message_text("Ошибка: некорректный ID пользователя.")
+        await show_dev_menu(update, context)
+        return
+
     subject = selected_subject_for_removal.get(user_id)
 
     if not subject:
@@ -171,25 +203,22 @@ async def confirm_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_dev_menu(update, context)
         return
 
-    user_id_to_remove = None
-    for id, name in user_names.items():
-        if name == selected_user_name:
-            user_id_to_remove = id
-            break
-
-    if not user_id_to_remove:
-        logger.error(f"[DEV_CONFIRM_REMOVE] Не найден ID для имени '{selected_user_name}' при удалении из очереди '{subject}' пользователем {user_id}.")
-        await query.edit_message_text(f"Ошибка: ID пользователя '{selected_user_name}' не найден в списке пользователей.")
+    # Проверим, существует ли пользователь
+    if selected_user_id not in user_names:
+        logger.warning(f"[DEV_CONFIRM_REMOVE] Пользователь с ID {selected_user_id} не найден в user_names при попытке удалить из очереди '{subject}' от {user_id}.")
+        await query.edit_message_text(f"Пользователь с ID {selected_user_id} не найден в базе данных.")
         await start_remove_user_process(update, context)
         return
 
-    success = remove_user_from_queue(user_id_to_remove, subject)
+    selected_user_name = user_names[selected_user_id]["name"]
+
+    success = remove_user_from_queue(selected_user_id, subject)
     if success:
         await query.edit_message_text(f"Пользователь '{selected_user_name}' успешно удален из очереди '{subject}'.")
-        logger.info(f"[DEV_CONFIRM_REMOVE] Пользователь {user_id} удалил '{selected_user_name}' (ID {user_id_to_remove}) из очереди '{subject}'.")
+        logger.info(f"[DEV_CONFIRM_REMOVE] Пользователь {user_id} удалил '{selected_user_name}' (ID {selected_user_id}) из очереди '{subject}'.")
     else:
         await query.edit_message_text(f"Не удалось удалить '{selected_user_name}' из очереди '{subject}'. Возможно, пользователь уже был удален.")
-        logger.warning(f"[DEV_CONFIRM_REMOVE] Функция remove_user_from_queue вернула False при удалении '{selected_user_name}' (ID {user_id_to_remove}) из очереди '{subject}' пользователем {user_id}.")
+        logger.warning(f"[DEV_CONFIRM_REMOVE] Функция remove_user_from_queue вернула False при удалении '{selected_user_name}' (ID {selected_user_id}) из очереди '{subject}' пользователем {user_id}.")
 
     awaiting_user_selection.discard(user_id)
     selected_subject_for_removal.pop(user_id, None)
@@ -205,7 +234,7 @@ async def start_forget_user_process(update: Update, context: ContextTypes.DEFAUL
     awaiting_subject_selection.discard(user_id)
     awaiting_user_selection.discard(user_id)
     selected_subject_for_removal.pop(user_id, None)
-    awaiting_user_forget_selection.discard(user_id) # Очищаем и другие состояния
+    awaiting_user_forget_selection.discard(user_id)
     awaiting_subject_selection_add.discard(user_id)
     awaiting_user_selection_add.discard(user_id)
     selected_subject_for_add.pop(user_id, None)
@@ -219,8 +248,8 @@ async def start_forget_user_process(update: Update, context: ContextTypes.DEFAUL
         return
 
     keyboard = []
-    for uid, name in user_names.items():
-        keyboard.append([InlineKeyboardButton(f"{name} (ID: {uid})", callback_data=f'dev_confirm_forget_user_{uid}')])
+    for uid, data in user_names.items():
+        keyboard.append([InlineKeyboardButton(f"{data['name']} (ID: {uid})", callback_data=f'dev_confirm_forget_user_{uid}')])
 
     keyboard.append([InlineKeyboardButton("← Назад", callback_data='dev_menu')])
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -255,7 +284,7 @@ async def confirm_forget_user(update: Update, context: ContextTypes.DEFAULT_TYPE
         await start_forget_user_process(update, context)
         return
 
-    selected_user_name = user_names[selected_user_id]
+    selected_user_name = user_names[selected_user_id]["name"]
 
     del user_names[selected_user_id]
     logger.info(f"[DEV_CONFIRM_FORGET] Пользователь '{selected_user_name}' (ID {selected_user_id}) удалён из user_names пользователем {user_id}.")
@@ -288,7 +317,7 @@ async def start_add_user_process(update: Update, context: ContextTypes.DEFAULT_T
     awaiting_user_selection.discard(user_id)
     selected_subject_for_removal.pop(user_id, None)
     awaiting_user_forget_selection.discard(user_id)
-    awaiting_subject_selection_add.discard(user_id) # Очищаем и другие состояния
+    awaiting_subject_selection_add.discard(user_id)
     awaiting_user_selection_add.discard(user_id)
     selected_subject_for_add.pop(user_id, None)
     selected_user_for_add.pop(user_id, None)
@@ -331,8 +360,8 @@ async def select_subject_for_add(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     keyboard = []
-    for uid, name in user_names.items():
-        keyboard.append([InlineKeyboardButton(f"{name} (ID: {uid})", callback_data=f'dev_select_user_add_{uid}')])
+    for uid, data in user_names.items():
+        keyboard.append([InlineKeyboardButton(f"{data['name']} (ID: {uid})", callback_data=f'dev_select_user_add_{uid}')])
 
     keyboard.append([InlineKeyboardButton("← Назад", callback_data='dev_add_user_start')])
 
@@ -376,7 +405,7 @@ async def select_user_for_add(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_dev_menu(update, context)
         return
 
-    selected_user_name = user_names[selected_user_id]
+    selected_user_name = user_names[selected_user_id]["name"]
     # Сохраняем выбранного пользователя
     selected_user_for_add[user_id] = selected_user_id
     # Меняем состояние: теперь ожидаем выбора позиции
@@ -425,7 +454,7 @@ async def select_position_for_add(update: Update, context: ContextTypes.DEFAULT_
         await show_dev_menu(update, context)
         return
 
-    selected_user_name = user_names[selected_user_id]
+    selected_user_name = user_names[selected_user_id]["name"]
 
     # Проверим, что позиция в допустимом диапазоне (1 до len+1)
     queue_length = len(queues[subject])
@@ -458,6 +487,253 @@ async def select_position_for_add(update: Update, context: ContextTypes.DEFAULT_
     # Возвращаем в главное меню разработчика
     await show_dev_menu(update, context)
 
+# --- Новая функция для очистки очередей от неизвестных пользователей ---
+
+async def clean_queues_from_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Очищает все очереди от пользователей, чьи имена не находятся в user_names."""
+    user_id = update.effective_user.id
+    logger.info(f"[DEV_CLEAN_UNKNOWN] Пользователь {user_id} запустил очистку очередей от неизвестных пользователей.")
+    query = update.callback_query
+    await query.answer()
+
+    total_removed = 0
+    user_names_list = [data["name"] for data in user_names.values()]
+    
+    for subject, queue_list in queues.items():
+        original_length = len(queue_list)
+        # Фильтруем очередь, оставляя только имена, которые есть в user_names
+        cleaned_queue = [name for name in queue_list if name in user_names_list]
+        removed_count = original_length - len(cleaned_queue)
+        total_removed += removed_count
+        if removed_count > 0:
+            queues[subject] = cleaned_queue
+            logger.info(f"[DEV_CLEAN_UNKNOWN] Из очереди '{subject}' удалено {removed_count} неизвестных пользователей.")
+
+    if total_removed > 0:
+        # Сохраняем изменения
+        from data import save_data_to_file
+        save_data_to_file()
+        logger.info(f"[DEV_CLEAN_UNKNOWN] Данные сохранены после удаления {total_removed} неизвестных пользователей.")
+        await query.edit_message_text(f"Очистка завершена. Удалено {total_removed} неизвестных пользователей из всех очередей.")
+    else:
+        await query.edit_message_text("Очистка завершена. Неизвестных пользователей не найдено.")
+    # Возвращаем в главное меню разработчика
+    await show_dev_menu(update, context)
+
+# --- Функции для управления баном ---
+
+async def start_ban_user_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс бана пользователя."""
+    user_id = update.effective_user.id
+    logger.info(f"[DEV_BAN_START] Пользователь {user_id} начал процесс бана.")
+    query = update.callback_query
+    await query.answer()
+    
+    awaiting_ban_user_selection.discard(user_id)
+    
+    if not user_names:
+        await query.edit_message_text("Нет зарегистрированных пользователей для бана.")
+        await show_dev_menu(update, context)
+        return
+    
+    awaiting_ban_user_selection.add(user_id)
+    keyboard = []
+    for uid, data in user_names.items():
+        if not data.get("banned", False):
+            keyboard.append([InlineKeyboardButton(f"{data['name']} (ID: {uid})", callback_data=f'dev_select_ban_user_{uid}')])
+    
+    keyboard.append([InlineKeyboardButton("← Назад", callback_data='dev_menu')])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text("Выберите пользователя для бана:", reply_markup=reply_markup)
+
+async def confirm_ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выполняет бан пользователя и отправляет ему уведомление."""
+    user_id = update.effective_user.id
+    logger.info(f"[DEV_BAN_CONFIRM] Пользователь {user_id} подтверждает бан.")
+    query = update.callback_query
+    await query.answer()
+    if user_id not in awaiting_ban_user_selection:
+        logger.warning(f"[DEV_BAN_CONFIRM] Пользователь {user_id} не в состоянии ожидания.")
+        await query.edit_message_text("Ошибка состояния. Начните снова.")
+        await show_dev_menu(update, context)
+        return
+
+    selected_user_id_str = query.data.split('dev_select_ban_user_')[1]
+    try:
+        selected_user_id = int(selected_user_id_str)
+    except ValueError:
+        logger.error(f"[DEV_BAN_CONFIRM] Неверный ID {selected_user_id_str}.")
+        await query.edit_message_text("Ошибка: некорректный ID пользователя.")
+        await show_dev_menu(update, context)
+        return
+
+    if selected_user_id not in user_names:
+        await query.edit_message_text("Пользователь не найден в базе данных.")
+        await start_ban_user_process(update, context)
+        return
+
+    selected_user_name = user_names[selected_user_id]["name"]
+    # success = ban_user(selected_user_id) # <-- БЫЛО
+    success = await ban_user(selected_user_id, app_instance=context.application) # <-- СТАЛО
+    if success:
+        await query.edit_message_text(f"✅ Пользователь '{selected_user_name}' (ID: {selected_user_id}) успешно забанен.")
+        logger.info(f"[DEV_BAN_CONFIRM] Пользователь {user_id} забанил '{selected_user_name}' (ID {selected_user_id}).")
+        # УВЕДОМЛЕНИЕ отправляется внутри ban_user
+    else:
+        await query.edit_message_text(f"❌ Не удалось забанить пользователя. Возможно, он уже забанен.")
+        logger.warning(f"[DEV_BAN_CONFIRM] Не удалось забанить {selected_user_id}.")
+
+    awaiting_ban_user_selection.discard(user_id)
+    await show_dev_menu(update, context)
+
+
+
+async def start_unban_user_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс разбана пользователя."""
+    user_id = update.effective_user.id
+    logger.info(f"[DEV_UNBAN_START] Пользователь {user_id} начал процесс разбана.")
+    query = update.callback_query
+    await query.answer()
+    
+    awaiting_unban_user_selection.discard(user_id)
+    
+    banned_list = get_all_banned_users()
+    
+    if not banned_list:
+        await query.edit_message_text("Список забаненных пользователей пуст.")
+        await show_dev_menu(update, context)
+        return
+    
+    awaiting_unban_user_selection.add(user_id)
+    keyboard = []
+    for uid, data in banned_list.items():
+        keyboard.append([InlineKeyboardButton(f"{data['name']} (ID: {uid})", callback_data=f'dev_confirm_unban_user_{uid}')])
+    
+    keyboard.append([InlineKeyboardButton("← Назад", callback_data='dev_menu')])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text("Выберите пользователя для разбана:", reply_markup=reply_markup)
+
+async def confirm_unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выполняет разбан пользователя."""
+    user_id = update.effective_user.id
+    logger.info(f"[DEV_UNBAN_CONFIRM] Пользователь {user_id} подтверждает разбан.")
+    query = update.callback_query
+    await query.answer()
+    if user_id not in awaiting_unban_user_selection:
+        logger.warning(f"[DEV_UNBAN_CONFIRM] Пользователь {user_id} не в состоянии ожидания.")
+        await query.edit_message_text("Ошибка состояния. Начните снова.")
+        await show_dev_menu(update, context)
+        return
+
+    selected_user_id_str = query.data.split('dev_confirm_unban_user_')[1]
+    try:
+        selected_user_id = int(selected_user_id_str)
+    except ValueError:
+        logger.error(f"[DEV_UNBAN_CONFIRM] Неверный ID {selected_user_id_str}.")
+        await query.edit_message_text("Ошибка: некорректный ID пользователя.")
+        await show_dev_menu(update, context)
+        return
+
+    success = await unban_user(selected_user_id, app_instance=context.application)
+    if success:
+        await query.edit_message_text(f"✅ Пользователь {selected_user_id} успешно разбанен.")
+        logger.info(f"[DEV_UNBAN_CONFIRM] Пользователь {user_id} разбанил {selected_user_id}.")
+        
+        # --- ОТПРАВКА УВЕДОМЛЕНИЯ РАЗБАНЕННОМУ ПОЛЬЗОВАТЕЛЮ (опционально) ---
+        try:
+            await context.bot.send_message(
+                chat_id=selected_user_id,
+                text="✅ Вы разбанены и можете снова использовать бота."
+            )
+            logger.info(f"[DEV_UNBAN_CONFIRM] Уведомление о разбане отправлено пользователю {selected_user_id}.")
+        except Exception as e:
+            logger.warning(f"[DEV_UNBAN_CONFIRM] Не удалось отправить уведомление о разбане пользователю {selected_user_id}: {e}")
+        # ---
+    else:
+        await query.edit_message_text(f"❌ Не удалось разбанить пользователя.")
+        logger.warning(f"[DEV_UNBAN_CONFIRM] Не удалось разбанить {selected_user_id}.")
+
+    awaiting_unban_user_selection.discard(user_id)
+    await show_dev_menu(update, context)
+
+
+async def show_ban_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список забаненных пользователей."""
+    user_id = update.effective_user.id
+    logger.info(f"[DEV_SHOW_BAN_LIST] Пользователь {user_id} запросил банлист.")
+    query = update.callback_query
+    await query.answer()
+    
+    message = "📋 <b>Список забаненных пользователей:</b>\n\n"
+    
+    banned_list = get_all_banned_users()
+    
+    if not banned_list:
+        message += "Забаненные пользователи отсутствуют."
+    else:
+        for uid, data in banned_list.items():
+            message += f"🚫 {data['name']} (ID: <code>{uid}</code>)\n"
+    
+    keyboard = [[InlineKeyboardButton("← Назад", callback_data='dev_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(message, parse_mode='HTML', reply_markup=reply_markup)
+    logger.info(f"[DEV_SHOW_BAN_LIST] Банлист показан пользователю {user_id}.")
+
+async def update_rating_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обновляет рейтинг из Яндекс.Диска и показывает топ."""
+    user_id = update.effective_user.id
+    logger.info(f"[DEV_RATING] Пользователь {user_id} обновляет рейтинг")
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("⏳ Обновляю рейтинг из Яндекс.Диска...")
+
+    # Обновляем рейтинг
+    result = update_rating('ЯП')
+    if result:
+        logger.info(f"[DEV_RATING] Рейтинг успешно обновлен ({len(result)} студентов)")
+
+        # Извлекаем только фамилии и сортируем
+        surname_scores = {}
+        for full_name, score in result.items():
+            surname = full_name.split()[0]  # Берём первую часть (фамилию)
+            surname_scores[surname] = score
+
+        sorted_data = sorted(surname_scores.items(), key=lambda x: x[1], reverse=True)
+
+        # Разбиваем на части по 27 студентов (чтобы уложиться в лимиты сообщения с форматированием)
+        chunk_size = 27
+        chunks = [sorted_data[i:i + chunk_size] for i in range(0, len(sorted_data), chunk_size)]
+
+        # Отправляем каждую часть отдельным сообщением
+        for chunk_idx, chunk in enumerate(chunks, start=1):
+            message = f"<b>Рейтинг по ЯП :</b>\n\n"
+            for rank, (surname, score) in enumerate(chunk, start=(chunk_idx - 1) * chunk_size + 1):
+                medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"{rank}."
+                message += f"{medal} <b>{surname}</b> — {score:.2f} лаб\n"
+            
+            if chunk_idx == len(chunks):
+                keyboard = [[InlineKeyboardButton("← Назад", callback_data='dev_menu')]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+            else:
+                reply_markup = None
+            
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text=message,
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+        logger.info(f"[DEV_RATING] Отправлено {len(chunks)} сообщений с рейтингом")
+    else:
+        message = "❌ Ошибка при обновлении рейтинга"
+        keyboard = [[InlineKeyboardButton("← Назад", callback_data='dev_menu')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
+        logger.error(f"[DEV_RATING] Ошибка обновления рейтинга")
+
 
 async def go_back_to_user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Возвращает пользователя из dev-меню в обычное меню."""
@@ -474,6 +750,9 @@ async def go_back_to_user_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     selected_subject_for_add.pop(user_id, None)
     selected_user_for_add.pop(user_id, None)
     awaiting_position_selection_add.discard(user_id)
+    # Очищаем состояния бана
+    awaiting_ban_user_selection.discard(user_id)
+    awaiting_unban_user_selection.discard(user_id)
 
     from user_handlers import show_subjects
     await show_subjects(update)
@@ -502,6 +781,8 @@ async def handle_dev_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         selected_subject_for_add.pop(user_id, None)
         selected_user_for_add.pop(user_id, None)
         awaiting_position_selection_add.discard(user_id)
+        awaiting_ban_user_selection.discard(user_id)
+        awaiting_unban_user_selection.discard(user_id)
         await show_dev_menu(update, context)
     elif data == 'dev_show_db':
         awaiting_subject_selection.discard(user_id)
@@ -534,6 +815,24 @@ async def handle_dev_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await start_forget_user_process(update, context)
     elif data.startswith('dev_confirm_forget_user_'):
         await confirm_forget_user(update, context)
+    # --- Новый обработчик для очистки ---
+    elif data == 'dev_clean_unknown':
+        await clean_queues_from_unknown(update, context)
+    # --- Обработчики для бана ---
+    elif data == 'dev_ban_user_start':
+        await start_ban_user_process(update, context)
+    elif data.startswith('dev_select_ban_user_'):
+        await confirm_ban_user(update, context)
+    elif data == 'dev_unban_user_start':
+        await start_unban_user_process(update, context)
+    elif data.startswith('dev_confirm_unban_user_'):
+        await confirm_unban_user(update, context)
+    elif data == 'dev_show_ban_list':
+        await show_ban_list(update, context)
+    # ---
+    elif data == 'dev_update_rating':  # <-- НОВЫЙ ОБРАБОТЧИК
+        await update_rating_handler(update, context)
+        return  # ВАЖНО: не вызываем show_dev_menu снова
     elif data == 'dev_back_to_user_menu':
         await go_back_to_user_menu(update, context)
     else:
@@ -548,4 +847,6 @@ async def handle_dev_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         selected_subject_for_add.pop(user_id, None)
         selected_user_for_add.pop(user_id, None)
         awaiting_position_selection_add.discard(user_id)
+        awaiting_ban_user_selection.discard(user_id)
+        awaiting_unban_user_selection.discard(user_id)
         await show_dev_menu(update, context)

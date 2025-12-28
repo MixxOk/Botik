@@ -1,12 +1,17 @@
 import pickle
 import logging
 from constants import SUBJECTS, DATA_FILE
+from telegram.ext import Application
+
+application = None
 
 # Включаем логирование
 logger = logging.getLogger(__name__)
 
+
+
 # --- Хранилище данных ---
-# Словарь для хранения имён пользователей (ID -> имя)
+# Словарь для хранения пользователей: ID -> {"name": "Имя", "banned": False}
 user_names = {}
 # Очередь в виде словаря для каждого предмета
 queues = {subject: [] for subject in SUBJECTS}
@@ -31,20 +36,25 @@ def load_data_from_file():
         with open(DATA_FILE, 'rb') as f:
             loaded_data = pickle.load(f)
         # Обновляем словари
-        user_names.update(loaded_data.get('user_names', {}))
+        loaded_users = loaded_data.get('user_names', {})
+        # Конвертируем старый формат если нужно
+        for uid, data in loaded_users.items():
+            if isinstance(data, str):
+                user_names[uid] = {"name": data, "banned": False}
+            else:
+                user_names[uid] = data
+        
         queues.update(loaded_data.get('queues', {subject: [] for subject in SUBJECTS}))
         logger.info(f"Данные успешно загружены из {DATA_FILE}")
     except FileNotFoundError:
         logger.info(f"Файл {DATA_FILE} не найден. Используем начальные значения.")
-        # Если файл не существует, создадим его с начальными значениями
         save_data_to_file()
     except Exception as e:
         logger.error(f"Неизвестная ошибка при загрузке данных из файла {DATA_FILE}: {e}")
-        # В случае любой ошибки, создадим файл заново
         save_data_to_file()
 
 # Загружаем данные при импорте модуля
-load_data_from_file() # <-- Эта строка важна!
+load_data_from_file()
 
 # --- Функции для работы с данными ---
 def add_user_to_queue(user_id, subject, position=None):
@@ -54,9 +64,13 @@ def add_user_to_queue(user_id, subject, position=None):
     subject: Предмет (str)
     position: Позиция в очереди (int), если None - в конец
     """
-    name = user_names.get(user_id)
-    if not name or subject not in queues:
-        logger.warning(f"add_user_to_queue: Пользователь {user_id} ({name}) или предмет '{subject}' не найдены.")
+    if user_id not in user_names:
+        logger.warning(f"add_user_to_queue: Пользователь {user_id} не найден.")
+        return False
+    
+    name = user_names[user_id]["name"]
+    if subject not in queues:
+        logger.warning(f"add_user_to_queue: Предмет '{subject}' не найден.")
         return False
 
     if name in queues[subject]:
@@ -71,7 +85,7 @@ def add_user_to_queue(user_id, subject, position=None):
         queues[subject].append(name)
         logger.info(f"add_user_to_queue: Пользователь '{name}' (ID {user_id}) добавлен в конец очереди '{subject}'.")
 
-    save_data_to_file() # Сохраняем изменения
+    save_data_to_file()
     return True
 
 def remove_user_from_queue(user_id, subject):
@@ -80,10 +94,14 @@ def remove_user_from_queue(user_id, subject):
     user_id: ID пользователя (int)
     subject: Предмет (str)
     """
-    name = user_names.get(user_id)
+    if user_id not in user_names:
+        logger.warning(f"remove_user_from_queue: Пользователь {user_id} не найден.")
+        return False
+    
+    name = user_names[user_id]["name"]
     if name and name in queues[subject]:
         queues[subject].remove(name)
-        save_data_to_file() # Сохраняем изменения
+        save_data_to_file()
         logger.info(f"remove_user_from_queue: Пользователь '{name}' (ID {user_id}) удален из очереди '{subject}'.")
         return True
     else:
@@ -97,9 +115,13 @@ def move_user_in_queue(user_id, subject, new_position):
     subject: Предмет (str)
     new_position: Новая позиция (int)
     """
-    name = user_names.get(user_id)
-    if not name or subject not in queues or name not in queues[subject]:
-        logger.warning(f"move_user_in_queue: Пользователь {user_id} ({name}), предмет '{subject}' или пользователь не в очереди.")
+    if user_id not in user_names:
+        logger.warning(f"move_user_in_queue: Пользователь {user_id} не найден.")
+        return False
+    
+    name = user_names[user_id]["name"]
+    if subject not in queues or name not in queues[subject]:
+        logger.warning(f"move_user_in_queue: Пользователь '{name}' не в очереди '{subject}'.")
         return False
 
     if not (0 <= new_position < len(queues[subject])):
@@ -109,6 +131,82 @@ def move_user_in_queue(user_id, subject, new_position):
     old_position = queues[subject].index(name)
     queues[subject].remove(name)
     queues[subject].insert(new_position, name)
-    save_data_to_file() # Сохраняем изменения
+    save_data_to_file()
     logger.info(f"move_user_in_queue: Пользователь '{name}' (ID {user_id}) перемещен в очереди '{subject}' с позиции {old_position} на позицию {new_position}.")
     return True
+
+def is_user_banned(user_id):
+    """Проверяет, забанен ли пользователь."""
+    if user_id not in user_names:
+        return False
+    return user_names[user_id].get("banned", False)
+
+async def ban_user(user_id, app_instance=None): # <-- ДОБАВИТЬ app_instance
+    """Добавляет пользователя в бан."""
+    global application # <-- ДОБАВИТЬ ЭТУ СТРОКУ
+    if app_instance:
+        application = app_instance # <-- ОБНОВИТЬ application, если передано
+    
+    if user_id not in user_names:
+        logger.info(f"ban_user: Пользователь {user_id} не найден в user_names.")
+        return False
+    
+    if user_names[user_id]["banned"]:
+        logger.info(f"ban_user: Пользователь {user_id} уже забанен.")
+        return False
+    
+    user_names[user_id]["banned"] = True
+    user_name = user_names[user_id]["name"]
+    
+    # Удаляем пользователя из всех очередей
+    for subject in queues:
+        if user_name in queues[subject]:
+            queues[subject].remove(user_name)
+    
+    save_data_to_file()
+    logger.info(f"ban_user: Пользователь {user_id} ({user_name}) забанен.")
+    
+    # --- ОТПРАВКА УВЕДОМЛЕНИЯ ЗАБАНЕННОМУ ПОЛЬЗОВАТЕЛЮ ---
+    if application:
+        try:
+            await application.bot.send_message(
+                chat_id=user_id,
+                text="❌ Вы забанены и не можете больше использовать этого бота."
+            )
+            logger.info(f"ban_user: Уведомление о бане отправлено пользователю {user_id}.")
+        except Exception as e:
+            logger.warning(f"ban_user: Не удалось отправить уведомление о бане пользователю {user_id}: {e}")
+    # ---
+    return True
+
+async def unban_user(user_id, app_instance=None):
+    """Удаляет пользователя из бана."""
+    global application
+    if app_instance:
+        application = app_instance
+
+    if user_id not in user_names:
+        logger.info(f"unban_user: Пользователь {user_id} не найден в user_names.")
+        return False
+
+    user_names[user_id]["banned"] = False
+    save_data_to_file()
+    logger.info(f"unban_user: Пользователь {user_id} разбанен.")
+
+    # --- ОТПРАВКА УВЕДОМЛЕНИЯ РАЗБАНЕННОМУ ПОЛЬЗОВАТЕЛЮ (опционально) ---
+    if application:
+        try:
+            await application.bot.send_message(
+                chat_id=user_id,
+                text="✅ Вы разбанены и можете снова использовать бота."
+            )
+            logger.info(f"unban_user: Уведомление о разбане отправлено пользователю {user_id}.")
+        except Exception as e:
+            logger.warning(f"unban_user: Не удалось отправить уведомление о разбане пользователю {user_id}: {e}")
+    # ---
+    return True
+
+
+def get_all_banned_users():
+    """Возвращает словарь всех забаненных пользователей."""
+    return {uid: data for uid, data in user_names.items() if data.get("banned", False)}

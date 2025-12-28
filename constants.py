@@ -6,4 +6,4 @@ BOT_TOKEN = os.getenv("BOT_TOKEN") # Значение по умолчанию д
 # Названия предметов (для очередей)
 SUBJECTS = ["ЯП", "Физика", "Информатика"]
 
-DATA_FILE = "bot_data.db"  # Изменено на .db
+DATA_FILE = "bot_data.db"
